@@ -1,6 +1,16 @@
 import re
 import pandas as pd
 import os
+from openpyxl import load_workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+import logging
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# Get a logger instance
+logger = logging.getLogger(__name__)
 
 # Create the output directory
 OUTPUT_DIR = "output"
@@ -13,6 +23,43 @@ sheets = ["GSTN", "BOOKS"]
 data = {
     sheet: pd.read_excel(file_path, sheet_name=sheet, skiprows=1) for sheet in sheets
 }
+logger.info("File loaded, processing ...")
+
+
+def save_to_excel(file_path, result):
+    try:
+        # Load existing workbook
+        wb = load_workbook(file_path)
+
+        for sheet_name, df in result.items():
+            logger.info(f"Saving {sheet_name} sheet...")
+            if df is not None and not df.empty:
+                df = clean_columns(df, sheet_name)
+
+                # If sheet doesn't exist, create it
+                if sheet_name not in wb.sheetnames:
+                    wb.create_sheet(sheet_name)
+                ws = wb[sheet_name]
+
+                # Remove existing data starting from row 3 (if any)
+                max_col = ws.max_column
+                max_row = ws.max_row
+                if max_row >= 3:
+                    ws.delete_rows(3, max_row - 2)
+
+                # Write dataframe rows to worksheet starting from row 3
+                for r_idx, row in enumerate(
+                    dataframe_to_rows(df, index=False, header=False), start=3
+                ):
+                    for c_idx, value in enumerate(row, start=1):
+                        ws.cell(row=r_idx, column=c_idx, value=value)
+
+        # Save the workbook
+        wb.save(file_path)
+        return True
+    except Exception as e:
+        logger.error(f"Error in saving sheets : {e}")
+        return False
 
 
 def clean_columns(df: pd.DataFrame, sheet_name: str):
@@ -38,17 +85,23 @@ def clean_columns(df: pd.DataFrame, sheet_name: str):
                 continue
             new_col = col.replace("_gstn", "")
         else:
+            if col == "gstr1_filing_date":
+                if sheet_name != "MATCHED":
+                    df.drop(columns=col, inplace=True)
+                    continue
             new_col = col
         clean_cols.append(new_col)
     df.columns = clean_cols
 
     # Format Date
-    df["Invoice Date"] = pd.to_datetime(
-        df["Invoice Date"], errors="coerce"
-    ).dt.strftime("%d/%m/%Y")
-    df["gstr1_filing_date"] = pd.to_datetime(
-        df["gstr1_filing_date"], errors="coerce"
-    ).dt.strftime("%d/%m/%Y")
+    if "Invoice Date" in df.columns:
+        df["Invoice Date"] = pd.to_datetime(
+            df["Invoice Date"], errors="coerce"
+        ).dt.strftime("%d/%m/%Y")
+    if "gstr1_filing_date" in df.columns:
+        df["gstr1_filing_date"] = pd.to_datetime(
+            df["gstr1_filing_date"], errors="coerce"
+        ).dt.strftime("%d/%m/%Y")
 
     return df
 
@@ -156,10 +209,23 @@ result = {
     "MATCHED": matched_df.drop(columns="_merge"),
     "PREV_FY_ITC": None,
     "NOTINBOOKS": None,
-    "NEXT_FY_ITC": merged[merged["_merge"] == "right_only"].filter(
-        regex="GSTN|InvoiceNumber_original_books|^((?!_clean|_gstn).)*$"
-    ),
+    "NEXT_FY_ITC": None,
 }
+
+
+# Update NEXT_FY_ITC sheet
+next_fy_df = merged[merged["_merge"] == "right_only"]
+next_fy_df = next_fy_df.filter(
+    regex="GSTN|InvoiceNumber_original_books|^((?!_clean|_gstn).)*$"
+)
+# Move 'gstr1_filing_date' to the end if it exists
+if "gstr1_filing_date" in next_fy_df.columns:
+    cols = [col for col in next_fy_df.columns if col != "gstr1_filing_date"]
+    cols.append("gstr1_filing_date")
+    next_fy_df = next_fy_df[cols]
+
+result["NEXT_FY_ITC"] = next_fy_df
+
 
 # Categorize unmatched GSTN records
 gstn_unmatched = merged[merged["_merge"] == "left_only"].filter(
@@ -169,14 +235,21 @@ gstn_unmatched = merged[merged["_merge"] == "left_only"].filter(
 result["PREV_FY_ITC"], result["NOTINBOOKS"] = categorize_gstn(gstn_unmatched)
 
 # Export to Excel
-with pd.ExcelWriter(
-    file_path, engine="openpyxl", mode="a", if_sheet_exists="replace"
-) as writer:
-    for sheet_name, df in result.items():
-        if df is not None and not df.empty:
-            # Clean column names for output
-            df = clean_columns(df, sheet_name)
-            df.to_excel(writer, sheet_name=sheet_name, index=False)
+if not save_to_excel(file_path, result):
+    logger.error(f"Error in writing sheets to the file : {file_path}")
+
+logger.info(f"Processing successfully completed.")
+logger.info(f"File saved to the path : {file_path}.")
+
+# # Export to Excel
+# with pd.ExcelWriter(
+#     file_path, engine="openpyxl", mode="a", if_sheet_exists="replace"
+# ) as writer:
+#     for sheet_name, df in result.items():
+#         if df is not None and not df.empty:
+#             # Clean column names for output
+#             df = clean_columns(df, sheet_name)
+#             df.to_excel(writer, sheet_name=sheet_name, index=False)
 
 
 # # Export to Excel
